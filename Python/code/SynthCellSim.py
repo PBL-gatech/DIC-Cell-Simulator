@@ -17,20 +17,25 @@ Requires:
     scipy
     scikit-image
     matplotlib
-    opencv-python (if you use certain image transformations)
+    opencv-python
+    pyqtgraph
+    PyQt5
 
 Make sure you have:
     - BiasStaticNoiseData64.mat
     - Cell_PCA_data.mat
-in accessible locations.
+in accessible file paths.
 
 Usage:
-    python synthetic_cell_simulator.py
+    python SyntheticCellSimulator.py
 """
 
+import sys
 import numpy as np
-import matplotlib.pyplot as plt
 import cv2
+import pyqtgraph as pg
+from PyQt5 import QtWidgets, QtCore
+import matplotlib.pyplot as plt
 
 from math import sqrt
 from scipy.io import loadmat
@@ -43,25 +48,20 @@ from skimage.draw import polygon
 
 class SyntheticCellSimulator:
     """
-    SyntheticCellSimulator replicates the functionality of:
+    SyntheticCellSimulator replicates:
       - DefaultSyntheticCellParams.m
       - GenerateSyntheticCellSequence.m
       - and associated helper .m files.
+
+    Once constructed, you can:
+      1) load_mat_files(...) for .mat data
+      2) call GenerateSyntheticCellSequence() for results
+      3) or call generate_and_visualize_pyqtgraph() to auto-plot frames
     """
 
     def __init__(self, params=None):
         """
         Constructor sets default parameters, mirroring DefaultSyntheticCellParams.m
-
-        If params is not provided, we create default ones:
-           param.imsize = 64
-           param.NbrFrames = 100
-           param.epsf_M = 5
-           param.epsf_shear_angle = 225
-           param.epsf_sigma = 0.5
-           param.PixelspaceParam  (a sub-dict)
-           param.poiss_lambda, param.poiss_amp, ...
-           param.SNR, etc.
         """
         if params is None:
             self.params = self.default_params()
@@ -73,7 +73,7 @@ class SyntheticCellSimulator:
         self.pca_data = None    # Will hold 'PCA_data' from Cell_PCA_data.mat
 
     # ---------------------------------------------------------------------
-    # (1) "DefaultSyntheticCellParams.m" => default_params method
+    # (1) "DefaultSyntheticCellParams.m" => default_params
     # ---------------------------------------------------------------------
     def default_params(self):
         """
@@ -91,11 +91,10 @@ class SyntheticCellSimulator:
         # PixelSpaceParam sub-structure
         PixelspaceParam = {}
         PixelspaceParam["ImSize"] = param["imsize"]
-        # for rotation, scaling, etc., we pick random or defaults
         PixelspaceParam["RotationAngle"] = np.random.uniform(0, 360)
         PixelspaceParam["ScalingRatio"] = np.random.uniform(0.7, 0.8)
-        PixelspaceParam["Method"] = "fractal"      # e.g., "fractal", "perlin"
-        PixelspaceParam["Persistence"] = sqrt(2)   # e.g., used for fractal/perlin noise
+        PixelspaceParam["Method"] = "fractal"   # e.g. "fractal", "perlin", "sumofgauss"
+        PixelspaceParam["Persistence"] = sqrt(2)
         PixelspaceParam["NbrFrames"] = param["NbrFrames"]
         PixelspaceParam["Motion"] = "shrink-expand"
         param["PixelspaceParam"] = PixelspaceParam
@@ -106,195 +105,302 @@ class SyntheticCellSimulator:
         param["gauss_mu"] = 0
         param["gauss_sigma"] = 0.0181
         param["gauss_amp"] = 0.98
-        param["SNR"] = -1
+        param["SNR"] = -1  # in dB
 
         return param
 
     # ---------------------------------------------------------------------
-    # (2) "GenerateSyntheticCellSequence.m" => method name: GenerateSyntheticCellSequence
+    # (2) "GenerateSyntheticCellSequence.m" => GenerateSyntheticCellSequence
     # ---------------------------------------------------------------------
     def GenerateSyntheticCellSequence(self):
-            """
-            Replicates the logic in GenerateSyntheticCellSequence.m, including noise handling.
-            """
-            # Gather parameters
-            p = self.params
-            NbrFrames = p["NbrFrames"]
-            imsize = p["imsize"]
+        """
+        Replicates the logic from GenerateSyntheticCellSequence.m (MATLAB),
+        including noise handling, static/dynamic noise generation, and SNR scaling.
 
-            # Check that the .mat files have been loaded
-            if self.bias_data is None or self.pca_data is None:
-                raise ValueError("Please call load_mat_files(...) before generating the synthetic cell sequence.")
+        Returns
+        -------
+        I_N : ndarray
+            [imsize x imsize x NbrFrames], final noisy DIC image sequence
+        BW : ndarray
+            [imsize x imsize x NbrFrames], binary mask(s)
+        I : ndarray
+            [imsize x imsize x NbrFrames], noiseless cell surface
+        I_DIC : ndarray
+            [imsize x imsize x NbrFrames], noiseless DIC image
+        B : ndarray
+            [imsize x imsize], random bias (static)
+        """
+        p = self.params
+        NbrFrames = p["NbrFrames"]
+        imsize    = p["imsize"]
 
-            # Extract PCA data structure
-            PCA_struct = self.pca_data["PCA_data"][0, 0]
+        # Must have loaded .mat data
+        if self.bias_data is None or self.pca_data is None:
+            raise ValueError("Please call load_mat_files(...) before generating the synthetic cell sequence.")
 
-            # Generate random cell shape
-            d = PCA_struct["b"].shape[0]
-            x_syn_data = self.GenerateRandomCellShape(PCA_struct, d, 1)
-            half = d // 2
-            x, y = x_syn_data[:half, 0], x_syn_data[half:, 0]
+        # 1) Generate Random Cell
+        PCA_struct = self.pca_data["PCA_data"][0, 0]
+        d = PCA_struct["b"].shape[0]
+        x_syn_data = self.GenerateRandomCellShape(PCA_struct, d, 1)
+        half = d // 2
+        x, y = x_syn_data[:half, 0], x_syn_data[half:, 0]
 
-            # Embed coordinates into image space
-            I, BW = self.EmbedCoordToImageSpace(x, y, p["PixelspaceParam"])
+        # 2) Embed => I, BW
+        I, BW = self.EmbedCoordToImageSpace(x, y, p["PixelspaceParam"])
 
-            # Generate DIC kernel
-            epsf = self.DIC_EPSF(p["epsf_M"], p["epsf_shear_angle"], p["epsf_sigma"])
-            I_DIC = np.stack([convolve2d(I[:, :, f], epsf, mode='same') for f in range(NbrFrames)], axis=-1)
+        # 3) DIC kernel => I_DIC
+        epsf = self.DIC_EPSF(p["epsf_M"], p["epsf_shear_angle"], p["epsf_sigma"])
+        I_DIC = np.empty_like(I)
+        for f in range(NbrFrames):
+            I_DIC[..., f] = convolve2d(I[..., f], epsf, mode='same')
 
-            # Extract random bias
-            B = self.bias_data["Bias"][:, :, np.random.randint(self.bias_data["Bias"].shape[2])]
+        # 4) Random Bias => B
+        rand_idx = np.random.rand() * self.bias_data["Bias"].shape[2]
+        rand_idx = int(np.ceil(rand_idx)) - 1
+        B = self.bias_data["Bias"][:, :, rand_idx]
 
-            # Generate static noise
-            RAPSD = self.bias_data["RAPSD"][:, np.random.randint(self.bias_data["RAPSD"].shape[1])]
-            G = self.iRadialAvgPSD(RAPSD)
-            phase = np.exp(1j * 2 * np.pi * np.random.rand(*G.shape))
-            spectrum = np.sqrt(2) * G * phase  # Correct scaling added
-            N_static = np.real(np.fft.ifft2(np.fft.ifftshift(spectrum)))
+        # 5) Static noise from RAPSD
+        rand_idx_r = np.random.rand() * self.bias_data["RAPSD"].shape[1]
+        rand_idx_r = int(np.ceil(rand_idx_r)) - 1
+        rapsd_col = self.bias_data["RAPSD"][:, rand_idx_r]
 
-            # Generate dynamic noise
-            N_dyn = np.zeros((imsize, imsize, NbrFrames))
-            for f in range(NbrFrames):
-                poiss_noise = np.random.poisson(p["poiss_lambda"], size=(imsize, imsize)) * p["poiss_amp"]
-                gauss_noise = np.random.normal(p["gauss_mu"], p["gauss_sigma"], size=(imsize, imsize)) * p["gauss_amp"]
-                N_dyn[:, :, f] = poiss_noise + gauss_noise
+        G = self.iRadialAvgPSD(rapsd_col)
+        phase = np.exp(1j * 2 * np.pi * np.random.rand(*G.shape))
+        spectrum = np.sqrt(2) * G * phase
 
-            # Add static and dynamic noise
-            N_syn = N_static[:, :, None] + N_dyn
+        # ifftshift => ifft2 => real
+        spectrum_unshifted = np.fft.ifftshift(spectrum)
+        N_static = np.real(np.fft.ifft2(spectrum_unshifted))
 
-            # Scale signal for the desired SNR
-            signal_energy = np.sum(np.linalg.norm(I_DIC, axis=(0, 1))**2) / NbrFrames
-            noise_energy = np.sum(np.linalg.norm(N_syn, axis=(0, 1))**2) / NbrFrames
-            scale_factor = 10**(p["SNR"] / 10) * (noise_energy / signal_energy)
-            I *= scale_factor  # Apply scaling to both I and I_DIC
-            I_DIC *= scale_factor
+        # dynamic noise arrays
+        N_dyn = np.zeros((imsize, imsize, NbrFrames), dtype=float)
+        N_syn = np.zeros((imsize, imsize, NbrFrames), dtype=float)
 
-            # Add signal to noise
-            I_N = I_DIC + N_syn
+        signal_energy = np.zeros(NbrFrames, dtype=float)
+        noise_energy  = np.zeros(NbrFrames, dtype=float)
 
-            return I_N, BW, I, I_DIC, B
+        for f in range(NbrFrames):
+            # Poisson + Gaussian dynamic noise
+            poiss_noise = np.random.poisson(p["poiss_lambda"], size=(imsize, imsize))
+            poiss_noise = p["poiss_amp"] * poiss_noise
 
+            gauss_noise = np.random.normal(p["gauss_mu"], p["gauss_sigma"], size=(imsize, imsize))
+            gauss_noise = p["gauss_amp"] * gauss_noise
 
+            dyn_frame = poiss_noise + gauss_noise
+            N_dyn[..., f] = dyn_frame
+
+            # combined: static + dynamic
+            N_syn[..., f] = N_static + dyn_frame
+
+            # measure energies
+            signal_energy[f] = np.linalg.norm(I_DIC[..., f], 'fro')**2
+            noise_energy[f]  = np.linalg.norm(N_syn[..., f], 'fro')**2
+
+        sum_signal = np.sum(signal_energy)
+        sum_noise  = np.sum(noise_energy)
+        scale_factor = 10.0**(p["SNR"] / 10.0) * (sum_noise / sum_signal)
+
+        # scale signals
+        I     *= scale_factor
+        I_DIC *= scale_factor
+
+        # final result
+        I_N = I_DIC + N_syn
+        return I_N, BW, I, I_DIC, B
+
+    # ---------------------------------------------------------------------
+    # A new method that generates & visualizes frames with PyQtGraph
+    # ---------------------------------------------------------------------
+    def generate_and_visualize_pyqtgraph(self):
+        """
+        Generates the synthetic sequence and displays the frames in real-time
+        using PyQt5 + pyqtgraph, cycling through frames automatically.
+        """
+        # 1) Generate the data
+        I_N, _, I, I_DIC, B = self.GenerateSyntheticCellSequence()
+
+        num_frames = self.params["NbrFrames"]
+
+        # 2) Create a QApplication if none exists
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            app = QtWidgets.QApplication(sys.argv)
+
+        # 3) Create the main window with a 2x2 grid of Plots
+        win = pg.GraphicsLayoutWidget(show=True)
+        win.setWindowTitle("DIC Cell Simulator - PyQtGraph Visualization")
+        win.setWindowTitle("DIC Cell Simulator - PyQtGraph Visualization")
+        win.resize(800, 800)
+        win.setBackground('w')
+        p1 = win.addPlot(row=0, col=0, title="Noiseless Surface (I)")
+        p2 = win.addPlot(row=0, col=1, title="Noiseless DIC (I_DIC)")
+        p3 = win.addPlot(row=1, col=0, title="Noisy (I_N)")
+        p4 = win.addPlot(row=1, col=1, title="Noisy + Bias (I_DIC + B)")
+
+        imgItem1 = pg.ImageItem()
+        imgItem2 = pg.ImageItem()
+        imgItem3 = pg.ImageItem()
+        imgItem4 = pg.ImageItem()
+
+        p1.addItem(imgItem1)
+        p2.addItem(imgItem2)
+        p3.addItem(imgItem3)
+        p4.addItem(imgItem4)
+
+        p1.setAspectLocked(True)
+        p2.setAspectLocked(True)
+        p3.setAspectLocked(True)
+        p4.setAspectLocked(True)
+
+        current_frame = 0
+
+        def update_frames():
+            nonlocal current_frame
+
+            frame_I     = I[..., current_frame]
+            frame_I_DIC = I_DIC[..., current_frame]
+            frame_I_N   = I_N[..., current_frame]
+            frame_bias  = I_N[..., current_frame] + B
+
+            imgItem1.setImage(frame_I.T,     levels=(frame_I.min(),     frame_I.max()))
+            imgItem2.setImage(frame_I_DIC.T, levels=(frame_I_DIC.min(), frame_I_DIC.max()))
+            imgItem3.setImage(frame_I_N.T,   levels=(frame_I_N.min(),   frame_I_N.max()))
+            imgItem4.setImage(frame_bias.T,  levels=(frame_bias.min(),  frame_bias.max()))
+
+            current_frame += 1
+            if current_frame >= num_frames:
+                current_frame = 0  # loop from start
+
+        timer = QtCore.QTimer()
+        timer.timeout.connect(update_frames)
+        timer.start(33)  # ms => ~30 FPS
+
+        print("Launching PyQt event loop. Close window to end.")
+        sys.exit(app.exec_())
 
     # ---------------------------------------------------------------------
     # (3) "GenerateRandomCellShape.m"
     # ---------------------------------------------------------------------
     def GenerateRandomCellShape(self, PCA_struct, NbrCoeffs, NbrSyntheticCells):
         """
-        GenerateRandomCellShape method with corrected x_bar flattening to match MATLAB behavior.
+        GenerateRandomCellShape using KDE sampling, replicating the MATLAB code:
+          x_syn = x_bar + V * b_rand
+        for the last NbrCoeffs PCA dimensions.
         """
-        # Extract PCA components
-        b = PCA_struct["b"]  # Shape: (d, N)
-        V = PCA_struct["V"]  # Shape: (d, d)
-        x_bar = PCA_struct["x_bar"].flatten()  # Ensure x_bar is (d,) instead of (d, 1)
+        b = PCA_struct["b"]   # shape: (d, N)
+        V = PCA_struct["V"]   # shape: (d, d)
+        x_bar = PCA_struct["x_bar"].flatten()  # ensure shape (d,)
         d, N = b.shape
 
-        # Debugging log
         print(f"PCA_struct dimensions: b={b.shape}, V={V.shape}, x_bar={x_bar.shape}")
 
-        # Initialize output array
         x_syn_data = np.zeros((d, NbrSyntheticCells))
 
         c = 0
         while c < NbrSyntheticCells:
-            # Initialize random coefficients as a 1D array
             b_rand = np.zeros(d)
-
-            # Sample from the distribution of coefficients for the last NbrCoeffs dimensions
             for i in range(d - NbrCoeffs, d):
-                kde = gaussian_kde(b[i, :])  # Fit KDE for the i-th dimension
-                b_rand[i] = kde.resample(1).item()  # Extract a single value from the KDE
+                kde = gaussian_kde(b[i, :])  # fit KDE to i-th row of b
+                b_rand[i] = kde.resample(1).item()  # sample 1 random value
 
-            # Generate synthetic shape: x_syn = x_bar + V @ b_rand
-            x_syn = x_bar + V @ b_rand  # Ensure x_bar is 1D
-
-            # Debugging log for x_syn
+            x_syn = x_bar + V @ b_rand
             print(f"x_syn shape: {x_syn.shape}")
 
-            # Check for crossover and only keep valid shapes
+            # Only keep if no cross-over
             if not self.CheckCrossOver(x_syn):
-                x_syn_data[:, c] = x_syn  # Assign the 1D vector to the correct column
+                x_syn_data[:, c] = x_syn
                 c += 1
 
         return x_syn_data
-
-
-
 
     # ---------------------------------------------------------------------
     # (4) "EmbedCoordToImageSpace.m"
     # ---------------------------------------------------------------------
     def EmbedCoordToImageSpace(self, x, y, Param):
         """
-        Enhanced EmbedCoordToImageSpace to include spectral analysis and improved noise generation.
+        Replicates the MATLAB code. We generate a 2D cell shape in 'I_2D'
+        and then stack frames or apply motion logic if NbrFrames>1.
         """
         ImSize = Param["ImSize"]
         RotationAngle = Param["RotationAngle"]
-        ScalingRatio = Param["ScalingRatio"]
-        Method = Param.get("Method", "fractal")
-        NbrFrames = Param.get("NbrFrames", 1)
+        ScalingRatio  = Param["ScalingRatio"]
+        Method        = Param["Method"].lower()
+        NbrFrames     = Param["NbrFrames"]
 
+        # 1) Rotate
         theta = np.deg2rad(RotationAngle)
-        R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+        R = np.array([[np.cos(theta), -np.sin(theta)],
+                      [np.sin(theta),  np.cos(theta)]])
         xy_rot = R @ np.vstack((x, y))
 
+        # 2) Interpolate (spline) to make closed shape
         tck, u = splprep([xy_rot[0, :], xy_rot[1, :]], s=0, per=True)
         u_new = np.linspace(0, 1, 200)
         x_int, y_int = splev(u_new, tck)
 
+        # 3) Scale and center
         max_width = np.max(np.abs([x_int, y_int]))
-        x_int = x_int / max_width * ScalingRatio * (ImSize / 2)
-        y_int = y_int / max_width * ScalingRatio * (ImSize / 2)
+        x_int = (x_int / max_width) * ScalingRatio * (ImSize / 2)
+        y_int = (y_int / max_width) * ScalingRatio * (ImSize / 2)
 
         x_centered = x_int + (ImSize / 2)
         y_centered = y_int + (ImSize / 2)
-        BW = np.zeros((ImSize, ImSize), dtype=np.uint8)
-        rr, cc = polygon(y_centered, x_centered, shape=BW.shape)
-        BW[rr, cc] = 1
 
-        if Method.lower() == "perlin":
+        # 4) Create a binary mask (BW_2D)
+        BW_2D = np.zeros((ImSize, ImSize), dtype=np.uint8)
+        rr, cc = polygon(y_centered, x_centered, shape=BW_2D.shape)
+        BW_2D[rr, cc] = 1
+
+        # 5) Generate a noise field (fractal/perlin)
+        if Method == "perlin":
             P_N = self.perlin_noise((ImSize, ImSize), Param.get("Persistence", sqrt(2)))
-        elif Method.lower() == "fractal":
+        elif Method == "fractal":
             P_N = self.fractal_noise((ImSize, ImSize), Param.get("Persistence", 1.0))
         else:
-            P_N = np.zeros((ImSize, ImSize))
+            P_N = np.zeros((ImSize, ImSize), dtype=float)
 
+        # Normalize P_N to [0..1]
         P_N -= np.min(P_N)
-        P_N /= np.max(P_N) if np.max(P_N) > 1e-12 else 1
+        max_p = np.max(P_N)
+        if max_p > 1e-12:
+            P_N /= max_p
 
-        H = gaussian_filter(BW.astype(float), sigma=3)
-        I = H + BW * P_N
+        # Basic cell image
+        H = gaussian_filter(BW_2D.astype(float), sigma=3)
+        I_2D = H + BW_2D * P_N
 
         if NbrFrames == 1:
-            return I, BW
+            # single-frame => return [H,W,1] arrays
+            return I_2D[..., None], BW_2D[..., None]
 
-        return self._create_motion_sequence(I, BW, P_N, Param)
+        # multi-frame => apply motion logic
+        return self._create_motion_sequence(I_2D, BW_2D, P_N, Param)
 
     def _create_motion_sequence(self, I_2D, BW_2D, P_N, Param):
         """
-        Helper: replicates the multi-frame motion logic from EmbedCoordToImageSpace.m
-        (barrel distortion, translation, etc.)
+        Creates a multi-frame sequence by applying barrel distortion, translations, etc.
         """
-        ImSize = Param["ImSize"]
-        Motion = Param["Motion"]
+        ImSize    = Param["ImSize"]
+        Motion    = Param["Motion"].lower()
         NbrFrames = Param["NbrFrames"]
-        Persistence = Param["Persistence"]
 
-        # we keep track of two 'maps': K for the mask, L for the noise
         K = BW_2D.astype(float)
         L = P_N.copy()
 
-        I_stack = np.zeros((ImSize, ImSize, NbrFrames), dtype=float)
+        I_stack  = np.zeros((ImSize, ImSize, NbrFrames), dtype=float)
         BW_stack = np.zeros((ImSize, ImSize, NbrFrames), dtype=np.uint8)
 
-        # define motion function a(f)
         def a_of_f(f):
-            if Motion.lower() == 'asympotic':
+            """
+            Motion parameter that can shrink/expand the shape each frame.
+            """
+            if Motion == 'asympotic':
                 return 1e-2 * np.exp(-(f**1.3))
-            elif Motion.lower() == 'shrink-expand':
+            elif Motion == 'shrink-expand':
                 turning_point = 0.25
                 return ((NbrFrames - f) / NbrFrames - turning_point) * 9e-6
-            elif Motion.lower() == 'expand-shrink':
+            elif Motion == 'expand-shrink':
                 turning_point = 0.25
                 return -(((NbrFrames - f)/NbrFrames) - turning_point) * 9e-6
             else:
@@ -303,17 +409,17 @@ class SyntheticCellSimulator:
         # define a random translation path
         trans_sigma = 2
         trans_start = trans_sigma * np.random.randn(2)
-        trans_end = -np.sign(trans_start) * np.abs(trans_sigma * np.random.randn(2))
+        trans_end   = -np.sign(trans_start) * np.abs(trans_sigma * np.random.randn(2))
 
         for f in range(NbrFrames):
             af = a_of_f(f)
 
-            # barrel-distortion equivalent
+            # apply barrel distortion
             K = self.barrel_distortion(K, af)
             L = self.barrel_distortion(L, af)
             K_mask = np.round(K).astype(np.uint8)
 
-            # combine with smooth filter
+            # re-combine
             J = gaussian_filter(K_mask.astype(float), sigma=3) + (K_mask * L)
 
             # translation
@@ -321,20 +427,19 @@ class SyntheticCellSimulator:
             tx = trans_start[0] + t*(trans_end[0] - trans_start[0])
             ty = trans_start[1] + t*(trans_end[1] - trans_start[1])
 
-            # warp with OpenCV
             M_trans = np.float32([[1, 0, tx],
                                   [0, 1, ty]])
-            J_trans = cv2.warpAffine(J, M_trans, (ImSize, ImSize))
+            J_trans  = cv2.warpAffine(J, M_trans, (ImSize, ImSize))
             BW_trans = cv2.warpAffine(K_mask.astype(float), M_trans, (ImSize, ImSize))
             BW_trans = np.ceil(BW_trans).astype(np.uint8)
 
-            I_stack[:, :, f] = J_trans
-            BW_stack[:, :, f] = BW_trans
+            I_stack[..., f]  = J_trans
+            BW_stack[..., f] = BW_trans
 
         return I_stack, BW_stack
 
     # ---------------------------------------------------------------------
-    # (5) "DIC_EPSF.m" => DIC_EPSF method
+    # (5) "DIC_EPSF.m"
     # ---------------------------------------------------------------------
     def DIC_EPSF(self, M, shear_angle, epsf_sigma):
         """
@@ -350,69 +455,62 @@ class SyntheticCellSimulator:
         return EPSF
 
     # ---------------------------------------------------------------------
-    # (6) "iRadialAvgPSD.m" => iRadialAvgPSD method
+    # (6) "iRadialAvgPSD.m"
     # ---------------------------------------------------------------------
     def iRadialAvgPSD(self, PSD):
         """
         Python version of iRadialAvgPSD.m
+        PSD is a 1D array of radial amplitudes.
         """
         spectral_size = (len(PSD) - 1) * 2
         center = [spectral_size/2, spectral_size/2]
         F = np.ones((spectral_size, spectral_size), dtype=float) * PSD[-1]
 
         X, Y = np.meshgrid(np.arange(spectral_size), np.arange(spectral_size))
-        # fill from outside in
         for r in range(len(PSD)-1, 0, -1):
             radius = r
             XY = ((X - center[0])**2 + (Y - center[1])**2) <= radius**2
             F[XY] = PSD[r]
 
-        # shift
         F = np.fft.ifftshift(F)
-        # DC
+        # DC component
         F[0, 0] = PSD[0]
         return F
 
     # ---------------------------------------------------------------------
-    # (7) "CheckCrossOver.m" => CheckCrossOver method
+    # (7) "CheckCrossOver.m"
     # ---------------------------------------------------------------------
     def CheckCrossOver(self, x_temp):
         """
         Python version of CheckCrossOver.m
-        x_temp is 1D with concatenated (x1..xK, y1..yK).
-        Returns True if shape crosses over itself.
+        x_temp is 1D with the first half = x coords, second half = y coords.
         """
         d = len(x_temp)
         half = d // 2
         cross_itself = False
 
         for p in range(half):
-            # Reshuffle points to make p-th point the first coordinate
             x_part = np.concatenate((x_temp[p:half], x_temp[:p]))
             y_part = np.concatenate((x_temp[half + p:d], x_temp[half:half + p]))
 
-            # Normalize by first coordinate
             x0, y0 = x_part[0], y_part[0]
             x_part -= x0
             y_part -= y0
 
-            # Rotate such that the first two points are horizontal
             dx, dy = x_part[1] - x_part[0], y_part[1] - y_part[0]
             rot_angle = -np.arctan2(dy, dx)
-            cosA, sinA = np.cos(rot_angle), np.sin(rot_angle)
-            R = np.array([[cosA, -sinA], [sinA, cosA]])
+            R = np.array([[np.cos(rot_angle), -np.sin(rot_angle)],
+                          [np.sin(rot_angle),  np.cos(rot_angle)]])
             xy_rot = R @ np.vstack((x_part, y_part))
             x_part, y_part = xy_rot[0, :], xy_rot[1, :]
 
-            # Check crossovers with subsequent line segments
             coord1 = [x_part[0], y_part[0]]
             coord2 = [x_part[1], y_part[1]]
 
-            for k in range(2, len(x_part) - 1):  # Adjusted range
+            for k in range(2, len(x_part) - 1):
                 coord3 = [x_part[k], y_part[k]]
                 coord4 = [x_part[k + 1], y_part[k + 1]]
 
-                # Slopes and intercepts
                 denom1 = coord2[0] - coord1[0]
                 denom2 = coord4[0] - coord3[0]
                 if abs(denom1) < 1e-12 or abs(denom2) < 1e-12:
@@ -424,12 +522,9 @@ class SyntheticCellSimulator:
                 c2 = coord4[1] - m2 * coord4[0]
 
                 if abs(m1 - m2) < 1e-12:
-                    continue  # Parallel lines
+                    continue
 
-                # Intersection point
                 x_cross = (c2 - c1) / (m1 - m2)
-
-                # Check if the intersection is within segment bounds
                 if (
                     min(coord1[0], coord2[0]) < x_cross < max(coord1[0], coord2[0])
                     and min(coord3[0], coord4[0]) < x_cross < max(coord3[0], coord4[0])
@@ -442,14 +537,13 @@ class SyntheticCellSimulator:
 
         return cross_itself
 
-
     # ---------------------------------------------------------------------
-    # Additional helper functions to replicate functionality from .m code
-    # (e.g., perlin_noise, fractal_noise, barrel_distortion)
+    # Additional helper methods: perlin_noise, fractal_noise, barrel_distortion
     # ---------------------------------------------------------------------
     def perlin_noise(self, shape, persistence=0.0):
         """
-        Approx Python version of perlin_noise from the MATLAB code.
+        Approx python version of perlin_noise from the MATLAB code,
+        using repeated octaves and upsampling.
         """
         n, m = shape
         result = np.zeros((n, m), dtype=float)
@@ -457,8 +551,7 @@ class SyntheticCellSimulator:
         w = np.sqrt(n*m)
         while w > 3:
             i += 1
-            # small random field upscaled
-            # (use cv2 for interpolation or direct rescale)
+            # Create a smaller random field
             d = np.random.randn(n//2+1, m//2+1).astype(np.float32)
             d_big = cv2.resize(d, (m, n), interpolation=cv2.INTER_CUBIC)
             if abs(persistence) < 1e-12:
@@ -470,37 +563,26 @@ class SyntheticCellSimulator:
 
     def fractal_noise(self, shape, p=1.0):
         """
-        1/f^p fractal (pink) noise, akin to fractal_noise in MATLAB code.
+        1/f^p fractal (pink) noise. 
         """
         N, M = shape
-
-        # Explicitly generate grid with the target dimensions
         y, x = np.linspace(-0.5, 0.5, N), np.linspace(-0.5, 0.5, M)
         X, Y = np.meshgrid(x, y)
-
-        # Compute distance matrix
         D = np.sqrt(X**2 + Y**2)
-
-        # Create the 1/f^p filter
         with np.errstate(divide="ignore", invalid="ignore"):
             H = 1.0 / (D**p)
-        H[np.isnan(H)] = 0.0  # Replace NaNs with 0.0 to avoid issues
+        H[np.isnan(H)] = 0.0
         if np.linalg.norm(H) > 0:
-            H /= np.linalg.norm(H)  # Normalize H only if norm > 0
+            H /= np.linalg.norm(H)
 
-        # Generate random phase and apply the filter
         rand_phase = np.fft.fft2(np.random.randn(N, M))
         F = rand_phase * np.fft.fftshift(H)
         im = np.fft.ifft2(F).real
-
         return im
-
-
 
     def barrel_distortion(self, I, a):
         """
-        Python version of barrel_distortion from the MATLAB code in EmbedCoordToImageSpace.
-        If a>0 => image shrinks, if a<0 => expands.
+        If a>0 => 'shrink', a<0 => 'expand'. Replicates a mild radial transform.
         """
         nrows, ncols = I.shape
         xi, yi = np.meshgrid(np.arange(ncols), np.arange(nrows))
@@ -520,22 +602,19 @@ class SyntheticCellSimulator:
         return I_barrel
 
     # ---------------------------------------------------------------------
-    # (8) "Demo.m" => We'll replicate as an if __name__ == "__main__" block
+    # (8) "Demo.m" => if __name__ == "__main__": block
     # ---------------------------------------------------------------------
     def load_mat_files(self, bias_file, pca_file):
         """
-        Load .mat files (equivalent usage to what's in GenerateSyntheticCellSequence.m)
-        Checking for 'Bias', 'RAPSD', 'Cell_PCA_data' or 'PCA_data' as needed.
+        Load .mat files. Must contain 'Bias', 'RAPSD', and 'PCA_data'.
         """
         try:
             self.bias_data = loadmat(bias_file)
-            # Typically: self.bias_data['Bias'], self.bias_data['RAPSD'], ...
         except Exception as e:
             raise ValueError(f"Error loading bias file: {bias_file} - {str(e)}")
 
         try:
             self.pca_data = loadmat(pca_file)
-            # Typically: self.pca_data['PCA_data'][0,0]
         except Exception as e:
             raise ValueError(f"Error loading PCA file: {pca_file} - {str(e)}")
 
@@ -549,59 +628,29 @@ class SyntheticCellSimulator:
 
         print("Successfully loaded .mat files.")
 
+
 # ---------------------------------------------------------------------
-# (8) Demo.m => replicate in an if __name__ == "__main__" block
+# Usage example: replicate Demo.m in an if __name__ == "__main__": block
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
 
-
     # Create simulator instance and set parameters
     simulator = SyntheticCellSimulator()
+    # e.g., 100 frames (like the MATLAB script)
+    simulator.params["NbrFrames"] = 100
+    simulator.params["PixelspaceParam"]["NbrFrames"] = 100
     simulator.params["SNR"] = -10
-    simulator.params["NbrFrames"] = 5
     simulator.params["PixelspaceParam"]["RotationAngle"] = 45
     simulator.params["PixelspaceParam"]["ScalingRatio"] = 0.75
     simulator.params["PixelspaceParam"]["Method"] = "fractal"
 
+
     # Load the required .mat files (adjust paths accordingly)
     bias_file = r"C:\Users\sa-forest\Documents\GitHub\DIC-Cell-Simulator\MATLAB\BiasStaticNoiseData64.mat"
-    pca_file = r"C:\Users\sa-forest\Documents\GitHub\DIC-Cell-Simulator\MATLAB\Cell_PCA_data.mat"
+    pca_file  = r"C:\Users\sa-forest\Documents\GitHub\DIC-Cell-Simulator\MATLAB\Cell_PCA_data.mat"
     simulator.load_mat_files(bias_file, pca_file)
 
-    # Generate synthetic cell sequence
-    I_N, BW, I, I_DIC, B = simulator.GenerateSyntheticCellSequence()
+    # Instead of a Matplotlib-based for-loop, call our PyQtGraph visualizer:
+    simulator.generate_and_visualize_pyqtgraph()
 
-    # Visualize the results similar to MATLAB's Demo.m
-    for f in range(simulator.params["NbrFrames"]):
-        plt.figure(figsize=(12, 10))
 
-        # Plot noiseless surface image
-        plt.subplot(2, 2, 1)
-        plt.imshow(I[:, :, f], cmap="gray")
-        plt.title(f"Frame {f + 1}: Noiseless Surface Image I")
-        plt.axis("off")
-        # plt.contour(BW[:, :, f], [0.5], colors="b")
-
-        # Plot noiseless DIC image
-        plt.subplot(2, 2, 2)
-        plt.imshow(I_DIC[:, :, f], cmap="gray")
-        plt.title("Noiseless DIC Image I_DIC")
-        plt.axis("off")
-        # plt.contour(BW[:, :, f], [0.5], colors="b")
-
-        # Plot noisy image (static + dynamic noise)
-        plt.subplot(2, 2, 3)
-        plt.imshow(I_N[:, :, f], cmap="gray")
-        plt.title("Noisy Image I_N")
-        plt.axis("off")
-
-        # Plot noisy image with bias
-        plt.subplot(2, 2, 4)
-        plt.imshow(I_DIC[:, :, f] + B, cmap="gray")
-        plt.title("Noisy Image + Bias (I_N + B)")
-        plt.axis("off")
-
-        plt.tight_layout()
-        plt.show()
-
-    print("Simulation and visualization completed.")
