@@ -167,10 +167,7 @@ class SyntheticCellSimulator:
         G = self.iRadialAvgPSD(rapsd_col)
         phase = np.exp(1j * 2 * np.pi * np.random.rand(*G.shape))
         spectrum = np.sqrt(2) * G * phase
-
-        # ifftshift => ifft2 => real
-        spectrum_unshifted = np.fft.ifftshift(spectrum)
-        N_static = np.real(np.fft.ifft2(spectrum_unshifted))
+        N_static = np.real(np.fft.ifft2(spectrum))
 
         # dynamic noise arrays
         N_dyn = np.zeros((imsize, imsize, NbrFrames), dtype=float)
@@ -458,24 +455,36 @@ class SyntheticCellSimulator:
     # (6) "iRadialAvgPSD.m"
     # ---------------------------------------------------------------------
     def iRadialAvgPSD(self, PSD):
-        """
-        Python version of iRadialAvgPSD.m
-        PSD is a 1D array of radial amplitudes.
-        """
         spectral_size = (len(PSD) - 1) * 2
-        center = [spectral_size/2, spectral_size/2]
+
+        # 1) Use [1..spectral_size], not [0..spectral_size-1]
+        X, Y = np.meshgrid(
+            np.arange(1, spectral_size+1),
+            np.arange(1, spectral_size+1)
+        )
+
+        # 2) Match MATLAB’s center = ( (spectral_size+1)/2, (spectral_size+1)/2 )
+        center = ((spectral_size + 1) / 2.0, (spectral_size + 1) / 2.0)
+
+        # Initialize entire array to PSD(end)
         F = np.ones((spectral_size, spectral_size), dtype=float) * PSD[-1]
 
-        X, Y = np.meshgrid(np.arange(spectral_size), np.arange(spectral_size))
+        # 3) Fill radii from largest to smallest
+        #    The MATLAB code effectively does "for r = length(radius_space):-1:2"
+        #    but you can keep it simple by looping from PSD.size-1 down to 1
         for r in range(len(PSD)-1, 0, -1):
             radius = r
-            XY = ((X - center[0])**2 + (Y - center[1])**2) <= radius**2
-            F[XY] = PSD[r]
+            mask = ((X - center[0])**2 + (Y - center[1])**2 <= radius**2)
+            F[mask] = PSD[r]
 
+        # 4) Shift + put DC = PSD(1)
         F = np.fft.ifftshift(F)
-        # DC component
-        F[0, 0] = PSD[0]
+        F[0,0] = PSD[0]
+
         return F
+
+
+
 
     # ---------------------------------------------------------------------
     # (7) "CheckCrossOver.m"
