@@ -114,61 +114,66 @@ class SyntheticCellSimulator:
     # (2) "GenerateSyntheticCellSequence.m" => method name: GenerateSyntheticCellSequence
     # ---------------------------------------------------------------------
     def GenerateSyntheticCellSequence(self):
-        """
-        Replicates the logic in GenerateSyntheticCellSequence.m, including noise handling.
-        """
-        # Gather parameters
-        p = self.params
-        NbrFrames = p["NbrFrames"]
-        imsize = p["imsize"]
+            """
+            Replicates the logic in GenerateSyntheticCellSequence.m, including noise handling.
+            """
+            # Gather parameters
+            p = self.params
+            NbrFrames = p["NbrFrames"]
+            imsize = p["imsize"]
 
-        # Check that the .mat files have been loaded
-        if self.bias_data is None or self.pca_data is None:
-            raise ValueError("Please call load_mat_files(...) before generating the synthetic cell sequence.")
+            # Check that the .mat files have been loaded
+            if self.bias_data is None or self.pca_data is None:
+                raise ValueError("Please call load_mat_files(...) before generating the synthetic cell sequence.")
 
-        # Extract PCA data structure
-        PCA_struct = self.pca_data["PCA_data"][0, 0]
+            # Extract PCA data structure
+            PCA_struct = self.pca_data["PCA_data"][0, 0]
 
-        # Generate random cell shape
-        d = PCA_struct["b"].shape[0]
-        x_syn_data = self.GenerateRandomCellShape(PCA_struct, d, 1)
-        half = d // 2
-        x, y = x_syn_data[:half, 0], x_syn_data[half:, 0]
+            # Generate random cell shape
+            d = PCA_struct["b"].shape[0]
+            x_syn_data = self.GenerateRandomCellShape(PCA_struct, d, 1)
+            half = d // 2
+            x, y = x_syn_data[:half, 0], x_syn_data[half:, 0]
 
-        # Embed coordinates into image space
-        I, BW = self.EmbedCoordToImageSpace(x, y, p["PixelspaceParam"])
+            # Embed coordinates into image space
+            I, BW = self.EmbedCoordToImageSpace(x, y, p["PixelspaceParam"])
 
-        # Generate DIC kernel
-        epsf = self.DIC_EPSF(p["epsf_M"], p["epsf_shear_angle"], p["epsf_sigma"])
-        I_DIC = np.stack([convolve2d(I[:, :, f], epsf, mode='same') for f in range(NbrFrames)], axis=-1)
+            # Generate DIC kernel
+            epsf = self.DIC_EPSF(p["epsf_M"], p["epsf_shear_angle"], p["epsf_sigma"])
+            I_DIC = np.stack([convolve2d(I[:, :, f], epsf, mode='same') for f in range(NbrFrames)], axis=-1)
 
-        # Extract random bias
-        B = self.bias_data["Bias"][:, :, np.random.randint(self.bias_data["Bias"].shape[2])]
+            # Extract random bias
+            B = self.bias_data["Bias"][:, :, np.random.randint(self.bias_data["Bias"].shape[2])]
 
-        # Generate static noise
-        RAPSD = self.bias_data["RAPSD"][:, np.random.randint(self.bias_data["RAPSD"].shape[1])]
-        G = self.iRadialAvgPSD(RAPSD)
-        N_static = np.real(np.fft.ifft2(G * np.exp(1j * 2 * np.pi * np.random.rand(*G.shape))))
+            # Generate static noise
+            RAPSD = self.bias_data["RAPSD"][:, np.random.randint(self.bias_data["RAPSD"].shape[1])]
+            G = self.iRadialAvgPSD(RAPSD)
+            phase = np.exp(1j * 2 * np.pi * np.random.rand(*G.shape))
+            spectrum = np.sqrt(2) * G * phase  # Correct scaling added
+            N_static = np.real(np.fft.ifft2(np.fft.ifftshift(spectrum)))
 
-        # Generate dynamic noise
-        N_dyn = np.zeros((imsize, imsize, NbrFrames))
-        for f in range(NbrFrames):
-            poiss_noise = np.random.poisson(p["poiss_lambda"], size=(imsize, imsize)) * p["poiss_amp"]
-            gauss_noise = np.random.normal(p["gauss_mu"], p["gauss_sigma"], size=(imsize, imsize)) * p["gauss_amp"]
-            N_dyn[:, :, f] = poiss_noise + gauss_noise
+            # Generate dynamic noise
+            N_dyn = np.zeros((imsize, imsize, NbrFrames))
+            for f in range(NbrFrames):
+                poiss_noise = np.random.poisson(p["poiss_lambda"], size=(imsize, imsize)) * p["poiss_amp"]
+                gauss_noise = np.random.normal(p["gauss_mu"], p["gauss_sigma"], size=(imsize, imsize)) * p["gauss_amp"]
+                N_dyn[:, :, f] = poiss_noise + gauss_noise
 
-        # Add static and dynamic noise
-        N_syn = N_static[:, :, None] + N_dyn
-        I_N = I_DIC + N_syn
+            # Add static and dynamic noise
+            N_syn = N_static[:, :, None] + N_dyn
 
-        # Scale signal for the desired SNR
-        signal_energy = np.sum(np.linalg.norm(I_DIC, axis=(0, 1))**2) / NbrFrames
-        noise_energy = np.sum(np.linalg.norm(N_syn, axis=(0, 1))**2) / NbrFrames
-        scale_factor = 10**(p["SNR"] / 10) * (noise_energy / signal_energy)
-        I_DIC *= scale_factor
-        I_N *= scale_factor
+            # Scale signal for the desired SNR
+            signal_energy = np.sum(np.linalg.norm(I_DIC, axis=(0, 1))**2) / NbrFrames
+            noise_energy = np.sum(np.linalg.norm(N_syn, axis=(0, 1))**2) / NbrFrames
+            scale_factor = 10**(p["SNR"] / 10) * (noise_energy / signal_energy)
+            I *= scale_factor  # Apply scaling to both I and I_DIC
+            I_DIC *= scale_factor
 
-        return I_N, BW, I, I_DIC, B
+            # Add signal to noise
+            I_N = I_DIC + N_syn
+
+            return I_N, BW, I, I_DIC, B
+
 
 
     # ---------------------------------------------------------------------
@@ -548,89 +553,55 @@ class SyntheticCellSimulator:
 # (8) Demo.m => replicate in an if __name__ == "__main__" block
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    # Create instance
-    simulator = SyntheticCellSimulator()
 
-    # Just like Demo.m, we can set custom parameters
+
+    # Create simulator instance and set parameters
+    simulator = SyntheticCellSimulator()
     simulator.params["SNR"] = -10
     simulator.params["NbrFrames"] = 5
     simulator.params["PixelspaceParam"]["RotationAngle"] = 45
     simulator.params["PixelspaceParam"]["ScalingRatio"] = 0.75
     simulator.params["PixelspaceParam"]["Method"] = "fractal"
 
-    # Load .mat files (update paths as appropriate)
+    # Load the required .mat files (adjust paths accordingly)
     bias_file = r"C:\Users\sa-forest\Documents\GitHub\DIC-Cell-Simulator\MATLAB\BiasStaticNoiseData64.mat"
     pca_file = r"C:\Users\sa-forest\Documents\GitHub\DIC-Cell-Simulator\MATLAB\Cell_PCA_data.mat"
     simulator.load_mat_files(bias_file, pca_file)
 
-    # Generate the synthetic cell sequence
+    # Generate synthetic cell sequence
     I_N, BW, I, I_DIC, B = simulator.GenerateSyntheticCellSequence()
 
-    # Now replicate the plotting style of Demo.m
-    # We'll do a multi-frame style loop if 3D, or single if 2D.
-    if I.ndim == 2:
-        # single frame
-        plt.figure(figsize=(10, 8))
-        # subplot(2,2,1): I
+    # Visualize the results similar to MATLAB's Demo.m
+    for f in range(simulator.params["NbrFrames"]):
+        plt.figure(figsize=(12, 10))
+
+        # Plot noiseless surface image
         plt.subplot(2, 2, 1)
-        plt.imshow(I, cmap='gray')
-        plt.title("I")
-        plt.axis('off')
+        plt.imshow(I[:, :, f], cmap="gray")
+        plt.title(f"Frame {f + 1}: Noiseless Surface Image I")
+        plt.axis("off")
+        # plt.contour(BW[:, :, f], [0.5], colors="b")
 
-        # subplot(2,2,2): I_DIC
+        # Plot noiseless DIC image
         plt.subplot(2, 2, 2)
-        plt.imshow(I_DIC, cmap='gray')
-        plt.title("I_DIC")
-        plt.axis('off')
+        plt.imshow(I_DIC[:, :, f], cmap="gray")
+        plt.title("Noiseless DIC Image I_DIC")
+        plt.axis("off")
+        # plt.contour(BW[:, :, f], [0.5], colors="b")
 
-        # subplot(2,2,3): BW
+        # Plot noisy image (static + dynamic noise)
         plt.subplot(2, 2, 3)
-        plt.imshow(I_N, cmap='gray')
-        plt.title("I_N")
-        plt.axis('off')
+        plt.imshow(I_N[:, :, f], cmap="gray")
+        plt.title("Noisy Image I_N")
+        plt.axis("off")
 
-        # subplot(2,2,4): let's overlay BW on top of I_DIC
+        # Plot noisy image with bias
         plt.subplot(2, 2, 4)
-        plt.imshow(I_DIC, cmap='gray')
-        bw_mask = np.ma.masked_where(BW == 0, BW)
-        plt.imshow(bw_mask, cmap='jet', alpha=0.4)
-        plt.title("I_DIC + BW overlay")
-        plt.axis('off')
+        plt.imshow(I_DIC[:, :, f] + B, cmap="gray")
+        plt.title("Noisy Image + Bias (I_N + B)")
+        plt.axis("off")
 
         plt.tight_layout()
         plt.show()
 
-    else:
-        # multi-frame
-        n_frames = I.shape[2]
-        for f in range(n_frames):
-            plt.figure(figsize=(10, 8))
-
-            plt.subplot(2, 2, 1)
-            plt.imshow(I[:, :, f], cmap='gray')
-            plt.title(f"I (Frame {f+1})")
-            plt.axis('off')
-            # plt.contour(BW[:, :, f], [0.5], colors='b')
-
-            plt.subplot(2, 2, 2)
-            plt.imshow(I_DIC[:, :, f], cmap='gray')
-            plt.title("I_DIC")
-            plt.axis('off')
-            # plt.contour(BW[:, :, f], [0.5], colors='b')
-
-            plt.subplot(2, 2, 3)
-            plt.imshow(I_N[:, :, f], cmap='gray')
-            plt.title("I_N")
-            plt.axis('off')
-
-            plt.subplot(2, 2, 4)
-            plt.imshow(I_DIC[:, :, f], cmap='gray')
-            bw_mask = np.ma.masked_where(BW[:, :, f] == 0, BW[:, :, f])
-            plt.imshow(bw_mask, cmap='jet', alpha=0.3)
-            plt.title("I_DIC + BW overlay")
-            plt.axis('off')
-
-            plt.tight_layout()
-            plt.show()
-
-    print("Done generating synthetic data. Script finished.")
+    print("Simulation and visualization completed.")
